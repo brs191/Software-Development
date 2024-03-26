@@ -5,15 +5,15 @@
 
     While Engineering managers and Individual contributors, both focus on assessing the ability to design scalabe,
 
-    reliable, and efficient systems, interviews for enginering managers place additional emphasis on aspects beyond 
+    reliable, and efficient systems, interviews for engineering managers place additional emphasis on aspects beyond 
 
     technical design.
     
-    The Interviews evaluate a candiate's
+    The Interviews evaluate a candidate's
                 1. Leadership
                 2. Architectural perspective
-                3. Project Managment
-                4. Decision-making skils with-in the context of system design.
+                3. Project Management
+                4. Decision-making skills with-in the context of system design.
 
 
 2. What are the key Focus Areas
