@@ -1,4 +1,3 @@
-
 <!-- TOC -->
   * [1. Domain Name System](#1-domain-name-system)
     * [Important Details](#important-details)
@@ -69,12 +68,10 @@
     * [Unique IDs with Causality](#unique-ids-with-causality)
       * [UNIX time stamps](#unix-time-stamps)
       * [Twitter Snowflake](#twitter-snowflake)
-      * [Using logical clocks](#using-logical-clocks)
       * [TrueTime API](#truetime-api)
+      * [Summary](#summary)
   * [7. Distributed Monitoring](#7-distributed-monitoring)
     * [Distributed Monitoring](#distributed-monitoring)
-      * [System Design](#system-design)
-      * [Pre-requisites](#pre-requisites)
     * [Monitor Service-side errors](#monitor-service-side-errors)
       * [System Design](#system-design)
       * [Visualize](#visualize)
@@ -109,6 +106,10 @@
     * [Evaluation](#evaluation)
   * [14. Distributed Logging](#14-distributed-logging)
     * [System Design](#system-design)
+      * [Requirements](#requirements)
+      * [Building Blocks](#building-blocks)
+      * [API Design](#api-design)
+      * [Initial Design](#initial-design)
   * [15. Distributed Task Scheduling](#15-distributed-task-scheduling)
     * [Requirements](#requirements)
     * [System Design](#system-design)
@@ -1221,30 +1222,285 @@ This microservice can become a single point of failure, but a failover server ac
 ### Unique IDs with Causality
 
 #### UNIX time stamps
+NIX time stamps are granular to the millisecond and can be used to distinguish different events. We have an ID-generating server that can generate one ID in a single millisecond. Any request to generate a unique ID is routed to that server, which returns a time stamp and then returns a unique ID. The ability to generate an ID in milliseconds allows us to generate a thousand identifiers per second
+
+This means we can get 24 * 60 * 60 * 1000 = 86400000IDs in a day. 
+
+Our system works well with generating IDs, but it poses a crucial problem. The ID-generating server is a single point of failure (SPOF), and we need to handle it. To cater to SPOF, we can add more servers. Each server generates a unique ID for every millisecond. To make the overall identifier unique across the system, we attach the server ID with the UNIX time stamp. Then, we add a load balancer to distribute the traffic more efficiently. The design of a unique ID generator using a UNIX time stamps is given below:
+
+<kbd>
+<img src="./img/servers_unix_time_stamps.png">
+</kbd>
+
+**_pros_** - This approach is simple, scalable, and easy to implement. It also enables multiple servers to handle concurrent requests.
+
+**_cons_** - For two concurrent events, the same time stamp is returned and the same ID can be assigned to them. This way, the IDs are no longer unique.
+
 
 #### Twitter Snowflake
 
-#### Using logical clocks
+We can use some bits out of our targetted 64 bits for storing time and the remaining for other information. An overview of division is below:
+
+<kbd>
+<img src="./img/twitter_snowflake.png">
+</kbd>
+
+• **Sign bit**: A single bit is assigned as a sign bit, and its value will always be zero. It makes the overall number positive. Doing so helps to ensure that any programming environment using these identifiers interprets them as positive integers.
+
+• **Time stamp**: 41 bits are assigned for milliseconds. The Twitter Snowflake default epoch will be used. Its value is
+1288834974657, which is equivalent to November 4, 2010, 01:42:54 UTC. We can initiate our own epoch when our system will be deployed, say January 1, 2022, at 12 midnight can be the start of our epoch from zero. The maximum time to deplete this range is shown below:
+
+**Time to range depletion = 2^41/(365*24*60*60*1000) ~= 60 years**
+
+The above calculations give us 69 years before we need a new algorithm to generate IDs. As we saw earlier, if we can generate 1,000 identifiers per second, we aren’t able to get our target of a billion identifiers per day. Though now, in the Snowflake proposal, we have ample identifiers available when we utilize worker ID and machine local sequence numbers.
+
+• **Worker number**: The worker number is 10 bits. It gives us 2^10 = 1,024 worker IDs. The server creating the unique ID for its events will attach its ID.
+
+• **Sequence number**: The sequence number is 12 bits. For every ID generated on the server, the sequence number is incremented by one. It gives us **2^12 = 4,096 unique sequence numbers**. We’ll reset it to zero when it reaches 4,096. This number adds a layer to avoid duplication.
+
+<kbd>
+<img src="./img/twitter_snowflake_algo.png">
+</kbd>
+
+
+**_Pros_** - Twitter Snowflake uses the time stamp as the first component. Therefore, they’re time sortable. The ID generator is highly available as well
+
+**_Cons_** - IDs generated in a dead period are a problem. The dead period is when no request for generating an ID is made to the server. These IDs will be wasted since they take up identifier space. The unique range possible will deplete earlier than expected and create gaps in our global set of user IDs.
 
 #### TrueTime API
+
+Google’s TrueTime API in Spanner is an interesting option. Instead of a particular time stamp, it reports an interval of time. When asking for the current time, we get back two values: the earliest and latest ones. These are the earliest possible and latest possible time stamps.
+
+Based on its uncertainty calculations, the clock knows that the actual current time is somewhere within that interval. The width of the interval depends, among other things, on how long it has been since the local quartz clock was last synchronized with a more accurate clock source.
+
+Google deploys a GPS receiver or atomic clock in each data center, and clocks are synchronized within about 7 ms. This allows Spanner to keep the clock uncertainty to a minimum. The uncertainty of the interval is represented as epsilon.
+
+#### Summary
+
+- We want to avoid duplicate identifiers. Consider what will happen if duplicate payment or purchase orders are generated.
+
+- UUIDs provide probabilistic guarantees about the keys’ non-collision. Deterministically getting non-collision guarantees might need consensus among different distributed entities or stores and read from the replicated store.
+
+- As key length becomes large, it often causes slower tuple updates in a database. Therefore, identifiers should be big enough but not too big.
+
+- Often, it’s desirable that no one is able to guess the next ID. Otherwise, undesirable data leaks can happen, and the organization’s competitors may learn how many orders were processed in a day by simply looking at order IDs. Adding a few random numbers to the bits of the identifier make it hard to guess, although this comes at a performance cost.
+
+- We can use simple counters for generating unique IDs if we don’t want to relate ID to time. Fetching time stamps is slower than simple counters.
+
+- Fetching time stamps is slower than simple counters, though this requires that we store generated IDs persistently. The counter needs to be stored in the database. Storage comes with its own issues. These include multiple concurrent writes becoming overwhelming for the database and the database being the single point of failure.
+
+- For some distributed databases, such as Spanner, it can hurt to generate monotonically increasing or decreasing IDs. Google reports the following: “In fact, using monotonically increasing (or decreasing) values as row keys does not follow best practices in Spanner because it creates hotspots in the database, leading to a reduction in performance.”
 
 ## 7. Distributed Monitoring
 
 ### Distributed Monitoring
+A good monitoring system needs to clearly define what to measure and in what units (metrics). The monitoring system also needs to define threshold values of all metrics and the ability to inform appropriate stakeholders (alerts) when values are out of acceptable ranges.
 
-#### System Design
+Monitoring systems that collect measurements, show data, and send warnings when something appears wrong are helpful for the support team
 
-#### Pre-requisites
+**Metrics** - Metrics objectively define what we should measure and what units will be appropriate. Metric values provide an insight into the system at any point in time
+We need to collect values of metrics with minimal performance penalty.
+
+**Populating the Metrics** - The metrics should be logically centralized for global monitoring and alerting purposes. Fetching metrics is crucial to the monitoring system. Metrics can either be pushed or pulled into a monitoring system, depending on the preference of the user.
+
+In **pull strategy**, each monitored server merely needs to store the metrics in memory and send them to an exposed endpoint. The exposed endpoint allows the monitoring application to fetch the metrics itself. Servers sending too much data or sending data too frequently can’t overload the monitoring system. The monitoring system will pull data as per its own schedule.
+
+In other situations, though, **pushing strategy** may be beneficial, such as when a firewall prevents the monitoring system from accessing the server directly. The monitoring system has the ability to adjust a global configuration about the data to be collected and the interval at which servers and switches should push the data.
+
+**Persist the data** - A centralized in-memory metrics repository may be all that’s needed. However, for a large data center with millions of things to monitor, there will be an enormous amount of data to store, and a time-series database can help in this regard.
+
+_Time-series databases_ help maintain durability, which is an important factor. Without a historical view of events in a monitoring system, it isn’t very useful. Samples having a value of time stamp are stored in chronological sequence. So, a whole metric’s timeline can be shown in the form of a time series.
+
+**Application Metrics** - We may need to add code or APIs to expose metrics we care about for other components, notably our own applications. We embed logging or monitoring code in our applications, called code instrumentation, to collect information of interest.
+
+**Alerting** - Alerting is the part of a monitoring system that responds to changes in metric values and takes action. There are two components to an alert definition: a metrics-based condition or threshold, and an action to take when the values fall outside the permitted range.
 
 ### Monitor Service-side errors
 
+Requirements for -
+
+
+- Monitor critical local processes on a server for crashes.
+
+- Monitor any anomalies in the use of CPU/memory/disk/network bandwidth by a process on a server.
+
+- Monitor overall server health, such as CPU, memory, disk, network bandwidth, average load, and so on.
+
+- Monitor hardware component faults on a server, such as memory failures, failing or slowing disk, and so on.
+
+- Monitor the server’s ability to reach out-of-server critical services, such as network file systems and so on.
+
+- Monitor all network switches, load balancers, and any other specialized hardware inside a data center.
+
+- Monitor power consumption at the server, rack, and data center levels.
+
+- Monitor any power events on the servers, racks, and data center.
+
+- Monitor routing information and DNS for external clients.
+
+- Monitor network links and paths’ latency inside and across the data centers.
+
+- Monitor network status at the peering points.
+
+- Monitor overall service health that might span multiple data centers—for example, a CDN and its performance.
+
 #### System Design
+
+**High-level design**
+
+**_Storage_**: A time-series database stores metrics data, such as the current CPU use or the number of exceptions in an application.
+
+**_Data collector service_**: This fetches the relevant data from each service and saves it in the storage.
+
+**_Querying service_**: This is an API that can query on the time-series database and return the relevant information.
+
+<kbd>
+<img src="./img/hld_monitoring_system.png">
+</kbd>
+
+**Detailed Design of a Monitoring System**
+
+Let's discuss the core components of our monitoring system, identify the shortcomings of our design, and improve the design to fulfill our requirements.
+
+**_Storage_**
+We’ll use time-series databases to save the data locally on the server where our monitoring service is running. Then, we’ll integrate it with a separate storage node. We’ll use blob storage to store our metrics.
+
+We need to store metrics and know which action to perform if a metric has reached a particular value. For example, if CPU usage exceeds 90%, we generate an alert to the end user so the alert receiver can do take the necessary steps, such as allocate more resources to scale. For this purpose, we need another storage area that will contain the rules and actions. Let’s call it a rules database. Upon any violation of the rules, we can take appropriate action.
+
+
+Add two more components in our design—that is, 
+1. a rules and action database
+2. a storage node (a blob store).
+
+<kbd>
+<img src="./img/lld_1_monitoring_system.png">
+</kbd>
+
+**Data collector** - We need a monitoring system to update us about our several data centers. We can stay updated if the information about our processes reaches us, which is possible through logging. We’ll choose a pull strategy. Then, we’ll extract our relevant metrics from the logs of the application.
+
+We shall use a distributed messaging queue. The message in the queue has the service name, ID, and a short description of the log. This will help us identify the metric and its information for a specific service. Exposing the relevant metrics to the data collector is necessary for monitoring any service so that our data collector can get the metrics from the service and store them into the time-series database.
+
+**Service discoverer** - 
+The data collector is responsible for fetching metrics from the services it monitors. This way, the monitoring system doesn’t need to keep a track of services. Instead, it can find them using discoverer service. We’ll save the relative information of the services we have to monitor. We’ll use a service discovery solution and integrate with several platforms and tools, including EC2, Kubernetes, and Consul. This will allow us to discover which services we have to monitor. Similar dynamic discovery can be used for newly commissioned hardware.
+
+A new component is added to our existing design
+- Service Discoverer
+
+<kbd>
+<img src="./img/lld_2_monitoring_system.png">
+</kbd>
+
+**Querying service** -
+We want a service to access the database and fetch the relevant query results. We need this because we want to view the errors like values of a particular node’s memory usage, or send an alert if a metric exceeds the set limit. Let’s add the two components we need along with querying.
+
+Two more components are added
+- Alert Manager
+- Dashboard
+
+_Alert Manager_ - The alert manager is responsible for sending alerts upon violations of set rules. It can send alerts as an email, a Slack message, and so on.
+
+_Dashboard_ - We can set dashboards by using the collected metrics to display the required information—for example, the number of requests in the current week.
+
+<kbd>
+<img src="./img/lld_3_monitoring_system.png">
+</kbd>
+
+Our all-in-one monitoring service works for actively tracking systems and services. It collects and stores data, and it supports searches, graphs, and alerts.
+
+**_Pros_** 
+- The design of our monitoring service ensures the smooth working of the operations and keeps an eye on signs of impending problems.
+- Our design avoids overloading the network traffic by fetching the data itself.
+- The monitoring service provides higher availability.
+
+**_Cons_**
+- The system seems scalable, but managing more servers to monitor can be a problem. For example, we have a dedicated server responsible for running the monitoring service. It can be a single point of failure (SPOF). To cater to SPOF, we can have a failover server for our monitoring system. Then, we also need to maintain consistency between actual and failover servers. However, such a design will also hit a scalability ceiling as the number of servers further increase.
+
+- Monitoring collects an enormous amount of data 24/7, and keeping it forever might not be feasible. We need a policy and mechanisms to delete unwanted data periodically to efficiently utilize the resources.
+
+**Improving our design**
+
+We want to improve our design so that our system can scale better and decide what data to keep and what to delete. Let’s see how the push-based approach works. In a push-based approach, the application pushes its data to the monitoring system.
+
+1. We used a pull-based strategy to avoid network congestion. This also allows the applications to be free of the aspect that they have to send the relevant monitoring data of to the system. Instead, the monitoring system fetches or pulls the data itself. To cater to scaling needs, we need to apply a push-based approach too. We’ll use a hybrid approach by combining our pull-based strategy with the push-based strategy.
+
+2. We’ll keep using a pull-based strategy for several servers within a data center. We’ll also assign several monitoring servers for hundreds or thousands of servers within a data center—let’s say one server monitoring 5,000 servers. We’ll call them secondary monitoring servers.
+
+3. Now, we’ll apply the push-based strategy. The secondary monitoring systems will push their data to a primary data center server. The primary data center server will push its data to a global monitoring service responsible for checking all the data centers spread globally.
+
+We’ll use blob storage to store our excessive data, apply elastic search, and view our relevant stats using a visualizer. As our servers or data centers increase, we’ll add more monitoring systems. The design for this is given below.
+
+<kbd>
+<img src="./img/lld_4_monitoring_system.png">
+</kbd>
+
 
 #### Visualize
 
+
+Large data centers have millions of servers, and visualizing the health data for all of them is challenging. An important aspect of monitoring a fleet of servers is to know which ones are alive and which ones are offline. A modern data center can house many thousands of servers in a building. We can use a heat map to display information about thousands of servers compactly in a data center.
+
+A heat map is a data visualization technique that shows the magnitude of a phenomenon in two dimensions by using colors.
+
+
+
+**Summary** -
+
+- Monitoring systems are critical in distributed systems because they help in analyzing the system and alerting the stakeholders if a problem occurs.
+
+- We can make a monitoring system scalable using a hybrid of the push and pull methods.
+
+- Heat maps are a powerful tool for visualization and help us learn about the health of thousands of servers in a compact space.
+
 ### Monitor Client-side errors
 
+**Client-side errors**
+In a distributed system, clients often access the service via an HTTP request. We can monitor our web and application servers’ logs if a request fails to process. If multiple requests fail, we can observe a spike in internal errors (error 500).
+
 #### System Design
+A service has no visibility of the errors that don’t occur at its infrastructure. Still, such failures are equally frustrating for the customers, and they might have to ask their friends, “Is the service X down for you as well?” or head to sites like Downdetector to see if anyone else is reporting the same issues. They might report the problem via a Tweet or some other communication channel. However, all such cases have a slow feedback loop. As a service provider, we want to detect such problems as quickly as possible to take remedial measures. Let’s design such a system.
+
+**Initial Design** -
+To ensure that the client’s requests reach the server, we’ll act as clients and perform reachability and health checks. We’ll need various vantage points across the globe. We can run a service, let’s call it prober, that periodically sends requests to the service to check availability. This way, we can monitor reachability to our service from many places.
+
+<kbd>
+<img src="./img/prober_client_side.png">
+</kbd>
+
+**Issues with probers** -
+
+_**Incomplete coverage**_: We might not have good coverage across all autonomous systems. There are 100,000 unique autonomous systems on the Internet as of March 2021. It’s not cost-effective or even possible to put those many probes across the globe. Country or ISP-specific regulations and the need for periodic maintenance are additional hurdles to implementing such a scheme.
+
+**_Lack of user imitation_**: Such probes might not represent a typical user behavior to explain how a typical user will use the service.
+
+**Improve the design** -
+Instead of using a prober on vantage points, we can embed the probers into the actual application instead.
+
+Below two components could be added -
+- **Agent**: This is a prober embedded in the client application that sends the appropriate service reports about any failures.
+
+- **Collector**: This is a report collector independent of the primary service. It’s made independent to avoid the situations where client agents want to report an error to the failed service. We summarize errors reports from collectors and look for spikes in the errors graph to see client-side issues.
+
+<kbd>
+<img src="./img/agent_collector_client_side.png">
+</kbd>
+
+**Activate and deactivate reports** -
+
+<kbd>
+<img src="./img/activate_deactivate_client_side.png">
+</kbd>
+
+**Reach collectors under faulty conditions** - 
+The collectors need to be in a different failure domain from the web service endpoint that we’re trying to monitor. The client side can try various collectors in different failure domains until one works. We can see a similar pattern in the following examples. At times, we refer to such a phenomenon as being outside the blast radius of a fault.
+
+**Protect user privacy** -
+The human user who uses the client-side software should be in full control to precisely know what data is collected and sent with each request. The user should also be able to reactivate the feature any time they wish.
+
+**Conclusion** 
+
+- In a distributed system, it’s difficult to detect and respond to errors on the client side. So, it’s necessary to monitor such events to provide a good user experience.
+
+- We can handle errors using an independent agent that sends service reports about any failures to a collector. Such collectors should be independent of the primary service in terms of infrastructure and deployment.
 
 ## 8. Distributed Caching
 
@@ -1305,17 +1561,319 @@ This microservice can become a single point of failure, but a failover server ac
 
 ## 14. Distributed Logging
 
+**Logging** -
+A **log file** records details of events occurring in a software application. The details may consist of microservices, transactions, service actions, or anything helpful to debug the flow of an event in the system. Logging is crucial to monitor the application’s flow.
+
+**Need for logging** -
+Logging is essential in understanding the flow of an event in a distributed system. It seems like a tedious task, but upon facing a failure or a security breach, logging helps pinpoint when and how the system failed or was compromised. It can also aid in finding out the root cause of the failure or breach. It decreases the meantime to repair a system.
+
+Concurrent activity by a service running on many nodes might need causality information to stitch together a correct flow of events properly. We must be careful while dealing with causality in a distributed system. We use a logging service to appropriately manage the diagnostic and exploratory data of our distributed software.
+
+Log analysis helps us with the following scenarios:
+
+- To troubleshoot applications, nodes, or network issues.
+- To adhere to internal security policies, external regulations, and compliance.
+- To recognize and respond to data breaches and other security problems.
+- To comprehend users’ actions for input to a recommender system.
+
+**Use categorization**
+Let’s look into the logging support provided by various programming languages. For example, there’s log4j and logging in Python. The following severity levels are commonly used in logging:
+
+- DEBUG
+- INFO
+- WARNING
+- ERROR
+- FATAL/CRITICAL
+
+Usually, the production logs are set to print messages with the severity of WARNING and above. But for more detailed flow, the severity levels can be set to DEBUG and INFO levels too.
+
+**Points to consider while logging**
+
+- Avoid logging personally identifiable information (PII), such as names, addresses, emails, and so on.
+- Avoid logging sensitive information like credit card numbers, passwords, and so on.
+- Avoid excessive information. Logging all information is unnecessary. It only takes up more space and affects performance. Logging, being an I/O-heavy operation, has its performance penalties.
+- The logging mechanism should be secure and not vulnerable because logs contain the application’s flow, and an insecure logging mechanism is vulnerable to hackers.
+
 ### System Design
+
+#### Requirements
+
+- **Functional Requirements**
+  - **Writing logs**: The services of the distributed system must be able to write into the logging system.
+  - **Searchable logs**: It should be effortless for a system to find logs. Similarly, the application’s flow from end-to-end should also be effortless.
+  - **Storing logging**: The logs should reside in distributed storage for easy access.
+  - **Centralized logging visualizer**: The system should provide a unified view of globally separated services.
+
+- **Non-Functional Requirements**
+  - **Low latency**: Logging is an I/O-intensive operation that is often much slower than CPU operations. We need to design the system so that logging is not on an application’s critical path.
+  - **Scalability**: We want our logging system to be scalable. It should be able to handle the increasing amounts of logs over time and a growing number of concurrent users. 
+  - **Availability**: The logging system should be highly available to log the data.
+
+
+#### Building Blocks
+- **Pub-sub System** - To handle the huge size of logs
+- **Distributed search** - To query logs efficiently
+
+<kbd>
+<img src="./img/distributed_log_1.png">
+</kbd>
+
+#### API Design
+
+**Write a Message** - 
+```
+write(unique_ID, msg_to_be_logged)
+```
+
+| Parameter            | Description                                                              |
+|----------------------|--------------------------------------------------------------------------|
+| unique_ID            | It is a numeric ID containing application-id, service-id and time stamp. |
+| message_to_be_logged | It is the log message stored against a unique key.                       |
+
+```
+searching(keyword)
+```
+
+| Parameter | Description                                             |
+|-----------|---------------------------------------------------------|
+| keyword   | It is used for finding the logs containing the keyword. |
+
+#### Design
+
+In a distributed system, clients across the globe generate events by requesting services from different serving nodes. The nodes generate logs while handling each of the requests. These logs are accumulated on the respective nodes.
+
+<kbd>
+<img src="./img/distributed_log_2.png">
+</kbd>
+
+The Major components of our system :-
+
+- **Log accumulator**: An agent that collects logs from each node and dumps them into storage. So, if we want to know about a particular event, we don't need to visit each node, and we can fetch them from our storage.
+- **Storage**: The logs need to be stored somewhere after accumulation. We will choose blob storage to save our logs.
+- **Log indexer**: The growing number of log files affects the searching ability. The log indexer will use the distributed search to search efficiently.
+- **Visualizer**: The Visualizer is used to provide a unified view of all the logs.
+
+**Logging at Server level**
+Consider a situation where we have multiple different applications on a server, such as App 1, App 2, and so on. Each application has various microservices running as well. For example, an e-commerce application can have services like authenticating users, fetching carts, and more running at the same time. Every service produces logs. We use an ID with application-id, service-id, and its time stamp to uniquely identify various services of multiple applications. Time stamps can help us to determine the causality of events.
+
+Each service will push its data to the **_log accumulator_** service. It is responsible for these actions:
+
+- Receiving the logs.
+- Storing the logs locally.
+- Pushing the logs to a pub-sub system.
+
+We use the pub-sub system to cater to our scalability issue. Now, each server has its log accumulator (or multiple accumulators) push the data to pub-sub. The pub-sub system is capable of managing a huge amount of logs.
+
+To fulfill another requirement of low latency, we don’t want the logging to affect the performance of other processes, so we send the logs asynchronously via a low-priority thread. By doing this, our system does not interfere with the performance of others and ensures availability.
+
+<kbd>
+<img src="./img/distributed_log_3.png">
+</kbd>
+
+We should be mindful that data can be lost in the process of logging huge amounts of messages. There is a trade-off between user-perceived latency and the guarantee that log data persists. For lower latency, log services often keep data in RAM and persist them asynchronously. Additionally, we can minimize data loss by adding redundant log accumulators to handle growing concurrent users.
+
+
+**Logging at Data center level**
+
+All servers in a data center push the logs to a pub-sub system. Since we use a horizontally-scalable pub-sub system, it is possible to manage huge amounts of logs. We may use multiple instances of the pub-sub per data center. It makes our system scalable, and we can avoid bottlenecks. Then, the pub-sub system pushes the data to the blob storage.
+
+The data does not reside in pub-sub forever and gets deleted after a few days before being stored in archival storage. However, we can utilize the data while it is available in the pub-sub system. The following services will work on the pub-sub data:
+
+**Filterer** - It identifies the application and stores the logs in the blob storage reserved for that application since we do not want to mix logs of two different applications.
+
+**Error aggregator** - t is critical to identify an error as quickly as possible. We use a service that picks up the error messages from the pub-sub system and informs the respective client. It saves us the trouble of searching the logs.
+
+**Alert aggregator** - Alerts are also crucial. So, it is important to be aware of them early. This service identifies the alerts and notifies the appropriate stakeholders if a fatal error is encountered, or sends a message to a monitoring tool.
+
+**Expiration checker** - Verifying the logs that have to be deleted. Verifying the logs to store in cold storage.
+
+<kbd>
+<img src="./img/distributed_log_4.png">
+</kbd>
+
+**Conclusion**
+
+- We learned how logging is crucial in understanding the flow of events in a distributed system. It helps to reduce the mean time to repair (MTTR) by steering us toward the root causes of issues.
+- Logging is an I/O-intensive operation that is time-consuming and slow. It is essential to handle it carefully and not affect the critical path of other services’ execution.
+- Logging is essential for monitoring because the data fetched from logs helps monitor the health of an application. (Alert and error aggregators serve this purpose.)
+
 
 ## 15. Distributed Task Scheduling
 
+A task is a piece of computational work that requires resources (CPU time, memory, storage, network bandwidth, and so on) for some specified time. For example, uploading a photo or a video on Facebook or Instagram consists of the following background tasks:
+
+1. Encode the photo or video in multiple resolutions.
+2. Validate the photo or video to check for content monetization copyrights, and many more.
+
+The successful execution of all the above tasks makes the photo or video visible. However, a photo and video uploader does not need to stop the above tasks to complete.
+
+In a system, many tasks contend for limited computational resources. A system that mediates between tasks and resources by intelligently allocating resources to tasks so that task-level and system-level goals are met is called a **task scheduler**.
+
 ### Requirements
+
+#### Functional Requirements
+
+- **Submit tasks** - The system should allow the users to submit their tasks for execution.
+- **Allocate resources** - The system should be able to allocate the required resources to each task.
+- **Remove tasks** - The system should allow the users to cancel the submitted tasks.
+- **Monitor task execution** - The task execution should be adequately monitored and rescheduled if the task fails to execute.
+- **Efficient resource utilization** - The resources (CPU and memory) must be used efficiently in terms of time, cost, and fairness. Fairness is all tenants’ ability to get the resources with equally likely probability in a certain cost class.
+- **Release resources** - After successfully executing a task, the system should take back the resources assigned to the task.
+- **Show task status** - The system should show the users the current status of the task.
+
+<kbd>
+<img src="./img/distributed_task_schedular_1.png">
+</kbd>
+
+
+#### Non-Functional Requirements
+
+**Availability** - The system should be highly available to schedule and execute tasks.
+**Durability** - The tasks received by the system should be durable and should not be lost.
+**Scalability** - The system should be able to schedule and execute an ever-increasing number of tasks per day.
+**Fault-Tolerance** - The system must be fault-tolerant by providing services uninterrupted despite faults in one or more of its components.
+**Bounded waiting time** - This is how long a task needs to wait before starting execution. We must not execute tasks much later than expected. Users shouldn’t be kept on waiting for an infinite time. If the waiting time for users crosses a certain threshold, they should be notified.
+
+<kbd>
+<img src="./img/distributed_task_schedular_2.png">
+</kbd>
+
+**Building blocks**
+
+<kbd>
+<img src="./img/distributed_task_schedular_3.png">
+</kbd>
+
+- **Rate limiter** is required to limit the number of tasks so that our system is reliable.
+- **A sequencer** is needed to uniquely identify tasks.
+- **Database(s)** are used to store task information.
+- **A distributed queue** is required to arrange tasks in the order of execution.
+- **Monitoring** is essential to check the health of the resources and to detect failed tasks to provide reliable service to the users.
 
 ### System Design
 
+**Components** 
+
+- **Clients**: They initiate the task execution
+- **Resources**: The task is executed on the components
+- **Scheduler**: A scheduler performs processes between clients and resources and decides which task should get resources first.
+
+<kbd>
+<img src="./img/distributed_task_schedular_4.png">
+</kbd>
+
+It is necessary to put the incoming tasks into a **queue**. For the following reasons -
+
+- We might not have sufficient resources available right now.
+- There is a task dependency, and some tasks need to wait for others.
+- We need to decouple the clients from the task execution so that they can hand off work to our system. Our system then queues it for execution.
+
+**Design**
+
+Input data of a task for scheduling -
+
+- **_Resource requirements_** - The requirements include how many CPU cores it needs, how much RAM is required to execute this task, how much disk space is required, what should the disk access rate be (input/output rate per second, or IOPS), and how many TCP ports the task needs for the execution, and so on. But, it is difficult for the clients to quantify these requirements. To remedy this situation, we have different tiers of resources like basic, regular, and premium. The client can specify the requirement in terms of these tiers.
+
+- _**Dependency**_ - Broadly, tasks can be of two types: dependent and independent.
+
+  - _Dependent tasks_ - require executing one or more additional tasks for their complete execution. These tasks must run in a sequence. For a dependent task, the client should provide a list of the tasks on which a given task is dependent.
+  
+  - _Independent tasks_ - don’t depend on the execution of any other task. Independent tasks can run in parallel. We should know whether a task is dependent or independent. The dependency information helps to execute both dependent tasks in order and independent tasks in parallel for efficient utilization of resources.
+  
+**Design components** -
+
+- **Clients** - The clients of the cloud providers are individuals or organizations from small to large businesses who want to execute their tasks.
+- **Rate limiter** - The resources available for a client depend on the cost they pay. It is important to limit the number of tasks for the reliability of our service.
+    For instance, X number of tasks per hour are allowed to enter the system. Others will get a message like "Limit exceeded" instead of accepting the task
+    and responding late. A rate limiter limits the tasks the client schedules based on its subscription. If the limit is exceeded,
+    it returns an error message to the client that the rate limit has been exceeded.
+- **Task submitter** - The task submitter admits the task if it successfully passes through the rate limiter. There isn't a single task submitter. Instead, we have a cluster of nodes that admit the increasing number of tasks.
+- **Unique ID generator** - It assigns unique IDs to the newly admitted tasks.
+
+<kbd>
+<img src="./img/distributed_task_schedular_5.png">
+</kbd>
+
+- **Database** - All the tasks taken by the task submitter are stored in a distributed database. For each task, we have some attributes, and all the attributes except one are stored in the relational database.
+  - **Relational database** - A relational database stores task IDs, user IDs, required resources, execution caps, the total number of attempts made by the client, delay tolerance, and so on.
+  - **Graph database** - This is a non-relational database that uses the graph data structure to store data. We use it to build and store a directed acyclic graph (DAG) of dependent tasks, topologically sorted by the task submitter, so that we can schedule tasks according to that DAG.
+- **Batching and prioritization** - After we store the tasks in the RDB, the tasks are grouped into batches. Prioritization is based on the attributes of the tasks, such as delay tolerance or the tasks with short execution cap, and so on. The top K priority tasks
+   are pushed into the distributed queue, where K limits the number of elements we can push into the queue. The value of K depends on
+   many factors, such as current available resources, the client or task priority, and subscription level.
+- **Distributed queue** - It consists of a queue and a queue manager. The queue manager adds, updates, or deletes tasks in the queue. It keeps track of the types of queues we use. It is also responsible for keeping the task in the queue until it executes successfully. In case a task execution fails, that task is made visible in the queue again. The queue manager knows which queue to run during the peak time and which queue to run during the off-peak time.
+- **Queue manager** - The queue manager deletes a task from the queue if it executes successfully. It also makes the task visible if its previous execution failed. It retries for the allowed number of attempts for a task in case of a failed execution.
+- **Resource manager** - The resource manager knows which of the resources are free. It pulls the tasks from the distributed queue and assigns them resources. The resource manager keeps track of the execution of each task and sends back their statuses to the queue manager. If a task goes beyond its promised or required resource use, that task will be terminated, and the status is sent back to the task submitter, which will notify the client about the termination of the task through an error message.
+- **Monitoring service** - It is responsible for checking the health of the resource manager and the resources. If some resource fails, it alerts the administrators to repair the resource or add new resources if required. If resources are not being used, it alerts the administrators to remove them or power them off.
+
+**Task submitter** - As we have seen above, every component we use in the design of the distributed task scheduler is distributed and therefore scalable and available. But, the task submitter could be a single point of failure. So, to handle this, we use a cluster of nodes. Each node must admit the tasks, send the tasks to a unique ID generator for ID assignment, and then store the task along with the task ID in the distributed database.
+
+#### Design considerations 
+
+**Queueing**
+
+A distributed queue is a major building block used by a scheduler. The simplest scheduling approach is to push the task into the queue on a **_first-come, first-served basis_**. If there are 10,000 nodes (resources) in a cluster (cloud), the task scheduler quickly extracts tasks from the queue and schedules them on the nodes. But, if all the resources are currently busy, then tasks will need to wait in the queue, and small tasks might need to wait longer.
+
+This scheduling mechanism can affect the reliability of the system, availability of the system, and priority of tasks. There could be cases where we want urgent execution of a task.
+
+Instead, we categorize the tasks and set appropriate priorities. We have the following three categories for our tasks:
+
+<kbd>
+<img src="./img/distributed_task_schedular_6.png">
+</kbd>
+
+This system ensures that tasks in non-urgent queues are not starved. As soon as some task’s delay limit is about to be reached, it is moved to the urgent tasks queue so that it gets service.
+
+**Execution gap**
+
+Some tasks take very long to execute and occupy the resource blocking other tasks. The **_execution cap_** is an important parameter to consider while scheduling tasks.
+If we completely allocate a resource to a single task and wait for that task’s completion, some tasks might not halt because of a bug in the task script that doesn’t let it finish its execution.
+
+We let the clients set the execution cap for their tasks. After that specified time, we should stop task execution, release the resource, and allocate it to the next task in the queue. If the task execution stops due to the execution cap limit, our system notifies the respective clients of these instances. The client needs to do appropriate remedial actions for such cases.
+
+If clients don’t set the execution cap, the scheduler uses its default upper bound on the maximum allowed time to kill the tasks.
+
+Cloud providers can’t let a task execute for an unlimited time for a basic (free) account, because using their resources costs a certain fee to the providers. To handle such cases, clients are informed about maximum usage limits so that they can handle long task execution. For example, clients may design their task in such a way that they checkpoint after some time and load from that state to resume progress in case resources are taken from the client due to usage limit.
+
+**Prioritization**
+
+There are tasks that need urgent execution. For example, in a social application like Facebook, the users can mark themselves safe during an emergency situation, such as an earthquake. The tasks that carry out this activity should be executed in a timely manner, otherwise this feature would be useless to Facebook users. Sending an email notification to the customers that their account was debited a certain amount of money is another example of tasks that require urgent execution.
+
+To **prioritize** the tasks, the task scheduler maintains a **delay tolerance parameter** for each task and executes the task close to its delay tolerance. **Delay tolerance** is the maximum amount of time a task execution could be delayed. The task that has the shortest delay tolerance time is executed first. By using a delay tolerance parameter, we can postpone the tasks with longer delay tolerance values to make room for urgent tasks during peak times.
+
+
+**Resource capacity optimization**
+
+There could be a time when resources are close to the overload threshold (for example, above 80% utilization). This is called peak time. The same resource may be idle during off-peak times. So, we have to think about better utilization of the resources during off-peak times and how to keep resources available during peak times.
+
+
 ### Evaluation
 
+- **Availability**
+  - The first component in our design was a rate limiter that is appropriately replicated and ensures availability.
+  - Task submission is done by several nodes. If a node that submits a task fails, the other nodes take its place.
+  - The queue in which we push the task is also distributed in nature, ensuring availability.
+  - We always have resources available because we continuously monitor if we need to add or remove resources.
+  - Each component in the design is distributed and makes the overall system available.
+
+- **Durability**
+  - We store the tasks in a persistent distributed database and push the tasks into the queue near their execution time.
+  - Once a task is submitted, it is in the database until its execution.
+
+- **Scalability**
+  - Our task scheduler provides scalability because the task submitter is distributed in our design.
+  - The tasks from RDB are then pushed to a distributed queue, which can scale with an increasing number of tasks.
+
+- **Fault tolerance**
+  - A task is not removed from the queue the first time it is sent for execution. If the execution fails, we retry for the maximum number of allowed attempts.
+  - If the task contains an infinite loop, we kill the task after some specified time and notify the user.
+
+- **Bounded waiting time**
+  - We don’t let the users wait for an infinite time. We have a limit on the maximum waiting time. If the limit is reached and we are unable to schedule the task for some reason, we notify the users and ask them to try again.
+
+
 ## 16. Shared Counters
+
+Real-time applications like Facebook, Twitter, and YouTube have high user traffic. Users interact with the applications and perform multiple operations (view, like, comment, and so on) depending on the application’s structure. For instance, an image is posted on a Facebook page that has millions of followers, and the post’s likes rapidly increase after each millisecond. Here, it might be easy to count the likes for this single image, but what will we do when thousands of such images or videos are uploaded simultaneously by many celebrities, each with millions of followers. This problem is known as the **_heavy hitters problem_**.
 
 ### High-level Design 
 
